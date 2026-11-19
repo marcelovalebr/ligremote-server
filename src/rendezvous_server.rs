@@ -17,7 +17,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::{listen_any, FramedStream},
+    tcp::{listen_any, Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -32,7 +32,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, sign};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -51,10 +51,17 @@ enum Data {
 const REG_TIMEOUT: i32 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
+// LIG Remote: estado da criptografia combinada no key exchange (versão 0), compartilhado
+// entre o laço de leitura e o Sink (que pode ir para o tcp_punch e responder depois).
+type TcpEnc = Arc<std::sync::Mutex<Encrypt>>;
 enum Sink {
-    TcpStream(TcpStreamSink),
+    TcpStream(TcpStreamSink, Option<TcpEnc>),
     Ws(WsSink),
 }
+/// Quanto o hbbs espera o cliente falar primeiro antes de oferecer o key exchange. Cliente
+/// logado com chave (secure_tcp) fica calado esperando o KeyExchange do servidor; os demais
+/// mandam a mensagem logo após conectar e seguem em texto puro, como no upstream.
+const KX_WAIT_MS: u64 = 1_000;
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
 static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
@@ -876,7 +883,14 @@ impl RendezvousServer {
         if let Some(sink) = sink.as_mut() {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
-                    Sink::TcpStream(s) => {
+                    Sink::TcpStream(s, enc) => {
+                        let bytes = match enc {
+                            Some(e) => match e.lock() {
+                                Ok(mut e) => e.enc(&bytes),
+                                Err(_) => return,
+                            },
+                            None => bytes,
+                        };
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
                     Sink::Ws(ws) => {
@@ -1234,11 +1248,70 @@ impl RendezvousServer {
             }
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+            sink = Some(Sink::TcpStream(a, None));
+            // LIG Remote: key exchange com o cliente logado (ver KX_WAIT_MS)
+            let mut kx_sk: Option<box_::SecretKey> = None;
+            let mut enc: Option<TcpEnc> = None;
+            let mut next = match timeout(KX_WAIT_MS, b.next()).await {
+                Ok(first) => first,
+                Err(_) => {
+                    if let Some(sk) = self.inner.sk.as_ref() {
+                        let (our_pk, our_sk) = box_::gen_keypair();
+                        let mut msg = RendezvousMessage::new();
+                        msg.set_key_exchange(KeyExchange {
+                            keys: vec![sign::sign(&our_pk.0, sk).into()],
+                            ..Default::default()
+                        });
+                        Self::send_to_sink(&mut sink, msg).await;
+                        kx_sk = Some(our_sk);
+                    }
+                    timeout(30_000, b.next()).await.ok().flatten()
+                }
+            };
+            while let Some(Ok(mut bytes)) = next {
+                if let Some(our_sk) = kx_sk.take() {
+                    if let Ok(RendezvousMessage {
+                        union: Some(rendezvous_message::Union::KeyExchange(ex)),
+                        ..
+                    }) = RendezvousMessage::parse_from_bytes(&bytes)
+                    {
+                        if ex.keys.len() != 2 {
+                            log::warn!("key exchange de {:?} com {} chaves", addr, ex.keys.len());
+                            break;
+                        }
+                        match Encrypt::decode(&ex.keys[1], &ex.keys[0], &our_sk) {
+                            Ok(k) => {
+                                let e = Arc::new(std::sync::Mutex::new(Encrypt::new(k)));
+                                if let Some(Sink::TcpStream(_, se)) = sink.as_mut() {
+                                    *se = Some(e.clone());
+                                }
+                                enc = Some(e);
+                                log::debug!("Tcp connection from {:?} secured", addr);
+                            }
+                            Err(err) => {
+                                log::warn!("key exchange de {:?} falhou: {}", addr, err);
+                                break;
+                            }
+                        }
+                        next = timeout(30_000, b.next()).await.ok().flatten();
+                        continue;
+                    }
+                    // cliente sem key exchange: segue em texto puro
+                }
+                if let Some(e) = enc.as_ref() {
+                    let ok = match e.lock() {
+                        Ok(mut e) => e.dec(&mut bytes).is_ok(),
+                        Err(_) => false,
+                    };
+                    if !ok {
+                        log::warn!("Tcp connection from {:?}: falha ao decifrar", addr);
+                        break;
+                    }
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
+                next = timeout(30_000, b.next()).await.ok().flatten();
             }
         }
         if sink.is_none() {
