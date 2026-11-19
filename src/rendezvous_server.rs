@@ -1,4 +1,5 @@
 use crate::common::*;
+use crate::ligremote;
 use crate::peer::*;
 use hbb_common::{
     allow_err, bail,
@@ -158,6 +159,7 @@ impl RendezvousServer {
         {
             ALWAYS_USE_RELAY.store(true, Ordering::SeqCst);
         }
+        ligremote::enabled(); // inicializa e loga o limite por licença já no boot
         log::info!(
             "ALWAYS_USE_RELAY={}",
             if ALWAYS_USE_RELAY.load(Ordering::SeqCst) {
@@ -351,6 +353,7 @@ impl RendezvousServer {
                         return send_rk_res(socket, addr, TOO_FREQUENT).await;
                     }
                     let peer = self.pm.get_or(&id).await;
+                    let is_new = peer.read().await.uuid.is_empty();
                     let (changed, ip_changed) = {
                         let peer = peer.read().await;
                         if peer.uuid.is_empty() {
@@ -414,6 +417,29 @@ impl RendezvousServer {
                             );
                         }
                     }
+                    if changed && is_new && ligremote::enabled() {
+                        // LIG Remote (ADR 0050): máquina nova só entra com vaga no plano.
+                        // Consulta fora do laço UDP; a resposta sai pelo canal tx.
+                        let mut me = self.clone();
+                        tokio::spawn(async move {
+                            let result: hbb_common::protobuf::EnumOrUnknown<register_pk_response::Result> =
+                                if ligremote::device_allowed(&id).await {
+                                me.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+                                register_pk_response::Result::OK.into()
+                            } else {
+                                log::info!("LIG Remote: {} recusado, limite de dispositivos do plano", id);
+                                // NOT_DEPLOYED (8) do cliente 1.5.x; o proto deste servidor ainda não tem o nome
+                                hbb_common::protobuf::EnumOrUnknown::from_i32(8)
+                            };
+                            let mut msg_out = RendezvousMessage::new();
+                            msg_out.set_register_pk_response(RegisterPkResponse {
+                                result,
+                                ..Default::default()
+                            });
+                            me.tx.send(Data::Msg(msg_out.into(), addr)).ok();
+                        });
+                        return Ok(());
+                    }
                     if changed {
                         self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
                     }
@@ -425,7 +451,7 @@ impl RendezvousServer {
                     socket.send(&msg_out, addr).await?
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
-                    if self.pm.is_in_memory(&ph.id).await {
+                    if !ligremote::enabled() && self.pm.is_in_memory(&ph.id).await {
                         self.handle_udp_punch_hole_request(addr, ph, key).await?;
                     } else {
                         // not in memory, fetch from db with spawn in case blocking me
@@ -502,6 +528,16 @@ impl RendezvousServer {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                    }
+                    if !ligremote::token_allowed(&rf.token).await {
+                        log::info!("LIG Remote: relay de {} para {} recusado, sem usuário logado", addr, rf.id);
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_punch_hole_response(PunchHoleResponse {
+                            other_failure: ligremote::MSG_LOGIN.into(),
+                            ..Default::default()
+                        });
+                        allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
+                        return true;
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
@@ -692,6 +728,15 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
+        if !ligremote::token_allowed(&ph.token).await {
+            log::info!("LIG Remote: conexão de {} para {} recusada, sem usuário logado", addr, ph.id);
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                other_failure: ligremote::MSG_LOGIN.into(),
                 ..Default::default()
             });
             return Ok((msg_out, None));
