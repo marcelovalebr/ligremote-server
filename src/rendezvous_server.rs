@@ -537,10 +537,10 @@ impl RendezvousServer {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
                     if !ligremote::token_allowed(&rf.token).await {
-                        log::info!("LIG Remote: relay de {} para {} recusado, sem usuário logado", addr, rf.id);
+                        log::info!("LIG Remote: relay de {} para {} recusado, {}", addr, rf.id, ligremote::motivo(&rf.token));
                         let mut msg_out = RendezvousMessage::new();
                         msg_out.set_punch_hole_response(PunchHoleResponse {
-                            other_failure: ligremote::MSG_LOGIN.into(),
+                            other_failure: ligremote::msg_recusa(&rf.token).into(),
                             ..Default::default()
                         });
                         allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
@@ -740,10 +740,10 @@ impl RendezvousServer {
             return Ok((msg_out, None));
         }
         if !ligremote::token_allowed(&ph.token).await {
-            log::info!("LIG Remote: conexão de {} para {} recusada, sem usuário logado", addr, ph.id);
+            log::info!("LIG Remote: conexão de {} para {} recusada, {}", addr, ph.id, ligremote::motivo(&ph.token));
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
-                other_failure: ligremote::MSG_LOGIN.into(),
+                other_failure: ligremote::msg_recusa(&ph.token).into(),
                 ..Default::default()
             });
             return Ok((msg_out, None));

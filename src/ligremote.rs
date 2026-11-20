@@ -22,6 +22,20 @@ use std::{
 pub const MSG_LOGIN: &str =
     "Para conectar, entre com sua conta LIG Remote em Configurações > Conta > Login. Se ainda não tem acesso, peça ao administrador da conta da sua empresa.";
 
+/// Token presente mas recusado: sessão vencida, encerrada, usuário desativado ou sem acesso a esta licença.
+pub const MSG_SESSAO: &str =
+    "Sua sessão do LIG Remote expirou ou não vale para esta empresa. Saia e entre de novo em Configurações > Conta. Se continuar, peça ao administrador da conta da sua empresa.";
+
+/// Mensagem da recusa: sem login ou com sessão que não vale mais.
+pub fn msg_recusa(token: &str) -> &'static str {
+    if token.is_empty() { MSG_LOGIN } else { MSG_SESSAO }
+}
+
+/// Motivo para o log (sem o token).
+pub fn motivo(token: &str) -> &'static str {
+    if token.is_empty() { "sem usuário logado" } else { "sessão inválida ou sem acesso à licença" }
+}
+
 const TTL_OK: Duration = Duration::from_secs(60);
 const TTL_RECUSA: Duration = Duration::from_secs(20);
 const TIMEOUT: Duration = Duration::from_secs(3);
